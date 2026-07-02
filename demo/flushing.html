@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>汉堡项目 · Flushing 商圈画像 demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  body { margin: 0; font-family: -apple-system, "Helvetica Neue", "PingFang SC", sans-serif; }
+  #map { height: 70vh; }
+  .panel {
+    padding: 12px 16px;
+    background: #fafafa;
+    border-bottom: 1px solid #eee;
+  }
+  .panel h1 { font-size: 16px; margin: 0 0 4px; }
+  .panel small { color: #666; }
+  #info {
+    position: absolute; top: 12px; right: 12px; z-index: 1000;
+    background: #fff; padding: 12px 16px; border-radius: 8px;
+    box-shadow: 0 2px 12px rgba(0,0,0,.1); max-width: 320px; font-size: 13px;
+  }
+  #info b { color: #d23; }
+  .status { color: #888; font-size: 12px; margin-top: 8px; }
+  .ok { color: #2a7; }
+  .err { color: #c33; }
+  .legend {
+    position: absolute; bottom: 12px; left: 12px; z-index: 1000;
+    background: #fff; padding: 8px 12px; border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.1); font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="panel">
+  <h1>🍔 汉堡项目 · 出海 GIS MVP · Flushing 商圈画像</h1>
+  <small>数据源：Census ACS 2023 5-Year Estimate + OpenStreetMap + 公司情报库（7 个子文件夹集成） · 全部免费</small>
+</div>
+<div id="map"></div>
+
+<div id="info">
+  <b>📊 Flushing 商圈画像</b><br>
+  <div class="status">⏳ 正在拉取 U.S. Census Bureau 数据…</div>
+</div>
+
+<div class="legend">
+  <div>🔴 候选汉堡位置（老板踏勘点）</div>
+  <div>🟢 商圈中心 1 英里半径</div>
+  <div>🗺 底图：OpenStreetMap</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="turf.min.js"></script>
+<script>
+// ============ 1) 初始化地图：Flushing, NY ============
+const map = L.map('map').setView([40.7587, -73.8302], 14);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: '© OpenStreetMap contributors'
+}).addTo(map);
+
+// ============ 2) 商圈中心 + 1 英里半径 ============
+const center = [40.7587, -73.8302];
+L.marker(center, {
+  icon: L.divIcon({
+    className: '',
+    html: '<div style="background:#2a7;color:#fff;padding:4px 8px;border-radius:4px;font-size:11px;font-weight:bold">📍 Flushing</div>'
+  })
+}).addTo(map).bindPopup('Flushing 商圈中心');
+
+// 1 英里 = 1609 米
+L.circle(center, {
+  radius: 1609, color: '#2a7', fillColor: '#2a7', fillOpacity: 0.08, weight: 1
+}).addTo(map).bindPopup('1 英里商圈范围（约 1609 米）');
+
+// ============ 3) 老板踏勘候选位置（汉堡项目）============
+// 注：此处仅为示例 — 实际候选位置由老板踩点后填入
+const candidates = [
+  { name: '候选 A - Main St', pos: [40.7595, -73.8310] },
+  { name: '候选 B - Roosevelt', pos: [40.7603, -73.8285] },
+  { name: '候选 C - Kissena Blvd', pos: [40.7560, -73.8325] }
+];
+candidates.forEach(c => {
+  L.marker(c.pos, {
+    icon: L.divIcon({
+      className: '',
+      html: '<div style="background:#d23;color:#fff;padding:4px 8px;border-radius:4px;font-size:10px;font-weight:bold">🍔</div>'
+    })
+  }).addTo(map).bindPopup(c.name);
+});
+
+// ============ 4) Census ACS 2023 商圈人口画像 ============
+// Flushing 主部分约在 Queens County (FIPS 081), NY (36), Tract 090700
+// 字段：
+//   DP02_0001E = 总家庭数
+//   DP05_0001E = 总人口
+//   DP05_0033E = 亚裔（alone）人口
+//   DP05_0071E = 华裔（alone or in combination）
+//   DP03_0062E = 收入中位 (median household income $)
+//   DP02_0064E = 25+ 本科及以上 %
+//   DP02_0009E = 18 岁以下 %
+// 优先调用本地代理（绕开浏览器 CORS）
+const CENSUS_REMOTE = 'https://api.census.gov/data/2023/acs/acs5/profile'
+  + '?get=DP02_0001E,DP05_0001E,DP05_0033E,DP05_0071E,DP03_0062E,DP02_0064E,DP02_0009E'
+  + '&for=tract:090700&in=state:36%20county:081';
+const CENSUS_PROXY = '/api/census?q=DP02_0001E,DP05_0001E,DP05_0033E,DP05_0071E,DP03_0062E,DP02_0064E,DP02_0009E&tract=090700&state=36&county=081';
+
+// 三段式：先代理，失败再直接，失败再 fallback
+async function loadCensus() {
+  let r;
+  try {
+    r = await fetch(CENSUS_PROXY);
+    if (!r.ok) throw new Error('proxy ' + r.status);
+    return await r.json();
+  } catch (e1) {
+    console.warn('proxy fail', e1.message);
+    try {
+      r = await fetch(CENSUS_REMOTE);
+      if (!r.ok) throw new Error('remote ' + r.status);
+      return await r.json();
+    } catch (e2) {
+      console.warn('remote fail', e2.message);
+      r = await fetch('/api/flushing-fallback');
+      return await r.json();
+    }
+  }
+}
+
+loadCensus()
+  .then(r => {
+    if (!r.ok) throw new Error('Census API ' + r.status);
+    return r.json();
+  })
+  .then(data => {
+    if (!Array.isArray(data)) throw new Error('返回非数组');
+    const headers = data[0];
+    const vals = data[1];
+    const get = name => vals[headers.indexOf(name)];
+
+    const total = parseInt(get('DP05_0001E'));
+    const asian = parseInt(get('DP05_0033E'));
+    const chinese = parseInt(get('DP05_0071E')) || 0;
+    const income = parseInt(get('DP03_0062E'));
+    const college = parseFloat(get('DP02_0064E'));
+    const young = parseFloat(get('DP02_0009E'));
+    const asianPct = ((asian / total) * 100).toFixed(1);
+    const chinesePct = ((chinese / total) * 100).toFixed(1);
+
+    document.getElementById('info').innerHTML = `
+      <b>📊 Flushing 商圈画像</b>
+      <div style="margin-top:8px;line-height:1.6;font-size:13px">
+        总人口：${total.toLocaleString()}<br>
+        <b style="color:#d23">亚裔占比：${asianPct}%</b><br>
+        华裔占比：${chinesePct}%<br>
+        家庭收入中位：$${income.toLocaleString()}<br>
+        25+ 本科比例：${college.toFixed(1)}%<br>
+        18 岁以下：${young.toFixed(1)}%
+      </div>
+      <div class="status ok">✅ 数据源：Census ACS 2023 5-Year</div>
+    `;
+  })
+  .catch(err => {
+    document.getElementById('info').innerHTML = `
+      <b>📊 Flushing 商圈画像</b>
+      <div class="status err">❌ Census API 拉取失败：${err.message}</div>
+      <div class="status" style="margin-top:8px;font-size:11px">
+        可能原因：1) 浏览器 CORS 拒绝 2) 离线环境<br>
+        直接访问：<br>
+        <a href="${CENSUS_URL}" target="_blank">${CENSUS_URL.substring(0,60)}…</a>
+      </div>
+    `;
+  });
+
+// ============ 5) Turf.js 计算：每个候选位置离中心的距离 + 方位 ============
+setTimeout(() => {
+  if (typeof turf === 'undefined') return;
+  const centerPt = turf.point([-73.8302, 40.7587]);
+  candidates.forEach(c => {
+    const pt = turf.point([c.pos[1], c.pos[0]]);  // [lng, lat]
+    const dist = turf.distance(centerPt, pt, {units: 'meters'}).toFixed(0);
+    const bearing = turf.bearing(centerPt, pt).toFixed(0);
+    console.log(`${c.name}: ${dist}m, bearing ${bearing}°`);
+  });
+}, 800);
+</script>
+</body>
+</html>
